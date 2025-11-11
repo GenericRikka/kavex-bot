@@ -3,3 +3,5 @@ __pycache__/
 .env
 *.sqlite3
 .env.example
+bot.sqlite3-shm
+bot.sqlite3-wal
