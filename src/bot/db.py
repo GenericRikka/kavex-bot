@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS guild_settings(
   guild_id INTEGER PRIMARY KEY,
   welcome_channel_id INTEGER,
   welcome_message TEXT DEFAULT 'Welcome to server_name, new_user!',
-  command_channel_id INTEGER
+  command_channel_id INTEGER,
+  default_role_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS xp(
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS xp(
 
 CREATE TABLE IF NOT EXISTS reaction_roles(
   guild_id INTEGER,
+  channel_id INTEGER,
   message_id INTEGER,
   emoji TEXT,
   role_id INTEGER,
@@ -42,8 +44,10 @@ class DB:
         self._conn = await aiosqlite.connect(self.path.as_posix())
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(INIT_SQL)
-        # MIGRATION: ensure command_channel_id exists on old DBs
+        # Migrations for existing DBs
         await self._ensure_column("guild_settings", "command_channel_id", "INTEGER")
+        await self._ensure_column("guild_settings", "default_role_id", "INTEGER")
+        await self._ensure_column("reaction_roles", "channel_id", "INTEGER")
         await self._conn.commit()
         return self
 

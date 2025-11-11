@@ -10,14 +10,12 @@ MSG_LINK_RE = re.compile(
 )
 
 async def _extract_message(interaction: discord.Interaction, raw: str) -> discord.Message:
-    # Accept a full link or a raw ID for messages in the current channel
     m = MSG_LINK_RE.match(raw)
     if m:
         channel_id = int(m.group("channel"))
         message_id = int(m.group("message"))
         channel = interaction.client.get_channel(channel_id) or await interaction.client.fetch_channel(channel_id)
         return await channel.fetch_message(message_id)
-    # Fallback: treat as ID from current channel
     message_id = int(raw)
     channel = interaction.channel
     if not isinstance(channel, discord.TextChannel):
@@ -31,18 +29,18 @@ class Welcome(commands.Cog):
     @app_commands.guild_only()
     @app_commands.command(name="welcome_use_message", description="Use a message's content as the welcome template")
     @app_commands.describe(message_link_or_id="Paste a message link or the message ID")
-    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.default_permissions(administrator=True)
     async def welcome_use_message(self, interaction: discord.Interaction, message_link_or_id: str):
         await db.ensure_connected()
         try:
             msg = await _extract_message(interaction, message_link_or_id)
         except Exception as e:
-            await interaction.response.send_message(f"Could not fetch that message: {e}", ephemeral=True)
+            await interaction.response.send_message(f"Could not fetch that message: {e}", ephemeral=False)
             return
 
         content = msg.content.strip()
         if not content:
-            await interaction.response.send_message("That message has no text content.", ephemeral=True)
+            await interaction.response.send_message("That message has no text content.", ephemeral=False)
             return
 
         await db.conn.execute(
@@ -53,31 +51,52 @@ class Welcome(commands.Cog):
             (content, interaction.guild_id),
         )
         await db.conn.commit()
-        await interaction.response.send_message("Welcome template updated from that message.", ephemeral=True)
+        await interaction.response.send_message("Welcome template updated from that message.", ephemeral=False)
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         await db.ensure_connected()
         cur = await db.conn.execute(
-            "SELECT welcome_channel_id, welcome_message FROM guild_settings WHERE guild_id=?",
+            "SELECT welcome_channel_id, welcome_message, default_role_id "
+            "FROM guild_settings WHERE guild_id=?",
             (member.guild.id,),
         )
         row = await cur.fetchone()
         if not row:
             return
-        channel_id, template = row["welcome_channel_id"], row["welcome_message"]
-        if not channel_id:
-            return
-        channel = member.guild.get_channel(channel_id)
-        if channel and isinstance(channel, discord.TextChannel):
-            text = apply_placeholders(template or "Welcome to server_name, new_user!",
-                                      member.guild.name, member.mention)
-            await channel.send(text)
 
-    # keep the old setter for channel (unchanged)
+        # Send welcome (if channel configured)
+        channel_id = row["welcome_channel_id"]
+        template = row["welcome_message"]
+        if channel_id:
+            channel = member.guild.get_channel(channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                text = apply_placeholders(
+                    template or "Welcome to server_name, new_user!",
+                    member.guild.name,
+                    member.mention
+                )
+                try:
+                    await channel.send(text)
+                except discord.HTTPException:
+                    pass
+
+        # Assign default role (if configured)
+        role_id = row["default_role_id"]
+        if role_id:
+            role = member.guild.get_role(role_id)
+            if role:
+                try:
+                    await member.add_roles(role, reason="Auto-assign default member role")
+                except discord.Forbidden:
+                    # Missing permissions or role hierarchy issue
+                    pass
+                except discord.HTTPException:
+                    pass
+
     @app_commands.guild_only()
     @app_commands.command(name="welcome_set_channel", description="Set the welcome channel")
-    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.default_permissions(administrator=True)
     async def set_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         await db.ensure_connected()
         await db.conn.execute(
@@ -90,7 +109,7 @@ class Welcome(commands.Cog):
         )
         await db.conn.commit()
         await interaction.response.send_message(
-            f"Welcome channel set to {channel.mention}.", ephemeral=True
+            f"Welcome channel set to {channel.mention}.", ephemeral=False
         )
 
 async def setup(bot):
