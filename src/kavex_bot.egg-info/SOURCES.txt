@@ -1,0 +1,12 @@
+LICENSE
+README.md
+pyproject.toml
+src/bot/__init__.py
+src/bot/db.py
+src/bot/main.py
+src/bot/utils.py
+src/kavex_bot.egg-info/PKG-INFO
+src/kavex_bot.egg-info/SOURCES.txt
+src/kavex_bot.egg-info/dependency_links.txt
+src/kavex_bot.egg-info/requires.txt
+src/kavex_bot.egg-info/top_level.txt

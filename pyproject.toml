@@ -1,0 +1,13 @@
+[project]
+name = "kavex-bot"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "discord.py>=2.4.0",
+  "aiosqlite>=0.20.0",
+  "python-dotenv>=1.0.1"
+]
+
+[tool.black]
+line-length = 100
+
