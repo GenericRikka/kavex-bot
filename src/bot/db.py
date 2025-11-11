@@ -31,6 +31,24 @@ CREATE TABLE IF NOT EXISTS reaction_roles(
   role_id INTEGER,
   PRIMARY KEY (guild_id, message_id, emoji)
 );
+
+CREATE TABLE IF NOT EXISTS mc_links(
+  guild_id INTEGER NOT NULL,
+  channel_id INTEGER NOT NULL,
+  token_hash TEXT NOT NULL,      -- sha256 of secret token
+  server_name TEXT,
+  last_seen REAL DEFAULT 0,
+  status TEXT DEFAULT 'pending', -- pending|connected|disconnected
+  PRIMARY KEY (guild_id, channel_id)
+);
+
+CREATE TABLE IF NOT EXISTS mc_webhooks(
+  guild_id INTEGER NOT NULL,
+  channel_id INTEGER NOT NULL,
+  webhook_id TEXT NOT NULL,
+  webhook_token TEXT NOT NULL,
+  PRIMARY KEY (guild_id, channel_id)
+);
 """
 
 class DB:

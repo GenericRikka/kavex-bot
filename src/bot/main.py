@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import commands
 from .db import db
+from .mc_ws import run_ws_app
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -14,12 +15,17 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents = discord.Intents.default()
+intents.guilds = True
+intents.message_content = True
+intents.members = True
 
 
 class MyBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._did_guild_sync = False
+        self._ws_task = None  # track the websocket task
 
     async def setup_hook(self):
         await db.connect()
@@ -32,7 +38,7 @@ class MyBot(commands.Bot):
             if interaction.guild_id is None:
                 if not interaction.response.is_done():
                     await interaction.response.send_message(
-                        "Commands must be used inside a server.", ephemeral=True
+                        "Commands must be used inside a server.", ephemeral=False
                     )
                 return False
 
@@ -58,7 +64,7 @@ class MyBot(commands.Bot):
             if not is_admin and cmd_name not in NONADMIN_ALLOW:
                 if not interaction.response.is_done():
                     await interaction.response.send_message(
-                        "Only **administrators** can use this bot.", ephemeral=True
+                        "Only **administrators** can use this bot.", ephemeral=False
                     )
                 return False
 
@@ -77,7 +83,7 @@ class MyBot(commands.Bot):
                 target = ch.mention if ch else f"<#{allowed_channel_id}>"
                 if not interaction.response.is_done():
                     await interaction.response.send_message(
-                        f"Use commands in {target}.", ephemeral=True
+                        f"Use commands in {target}.", ephemeral=False
                     )
                 return False
 
@@ -88,13 +94,15 @@ class MyBot(commands.Bot):
         # ------------------------------------------------------------------
         #  Load all cogs
         # ------------------------------------------------------------------
-        await self.load_extension("bot.cogs.welcome")
-        await self.load_extension("bot.cogs.leveling")
-        await self.load_extension("bot.cogs.reaction_roles")
-        await self.load_extension("bot.cogs.server_admin")
+        await self.load_extension("src.bot.cogs.welcome")
+        await self.load_extension("src.bot.cogs.leveling")
+        await self.load_extension("src.bot.cogs.reaction_roles")
+        await self.load_extension("src.bot.cogs.server_admin")
+        await self.load_extension("src.bot.cogs.minecraft")
+        await self.load_extension("src.bot.cogs.mc_forward")
 
         # ------------------------------------------------------------------
-        #  Global sync (may take minutes to appear globally)
+        #  Global sync
         # ------------------------------------------------------------------
         try:
             await self.tree.sync()
@@ -109,7 +117,7 @@ bot = MyBot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     logging.info("Logged in as %s (%s)", bot.user, bot.user.id)
-    # One-time per-guild sync for instant availability
+
     if not bot._did_guild_sync:
         for guild in bot.guilds:
             try:
@@ -119,6 +127,24 @@ async def on_ready():
             except Exception:
                 logging.exception("Guild sync failed for %s", guild.id)
         bot._did_guild_sync = True
+
+    # NEW: Preload channels to warm the cache (avoids fetch_* weirdness)
+    for guild in bot.guilds:
+        try:
+            chans = await guild.fetch_channels()
+            logging.info("Preloaded %d channels for guild %s (%s)", len(chans), guild.name, guild.id)
+        except Exception as e:
+            logging.warning("Channel preload failed for guild %s: %s", guild.id, e)
+
+    # Start WS server task (as you already do)
+    if bot._ws_task is None or bot._ws_task.done():
+        async def _runner():
+            try:
+                await run_ws_app()
+            except Exception:
+                logging.exception("WebSocket server task exited with an error")
+        bot._ws_task = asyncio.create_task(_runner())
+        logging.info("Scheduled MC WebSocket server task")
 
 
 async def main():
