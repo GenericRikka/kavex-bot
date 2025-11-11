@@ -6,3 +6,7 @@ bot.sqlite3-shm
 bot.sqlite3-wal
 .zshrc
 .ssh/
+.oh-my-zsh/
+.viminfo
+.zcompdump*
+.zsh*
