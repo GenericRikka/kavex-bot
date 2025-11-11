@@ -1,25 +1,105 @@
-# src/bot/mc_ws.py
 import asyncio
 import hashlib
 import json
 import logging
 import os
 import time
-from aiohttp import web
+from typing import Dict, List, Tuple, Optional
+
+from aiohttp import web, ClientSession
 from .db import db
-import discord
 
-MC_WS_HOST = os.getenv("MC_WS_HOST", "0.0.0.0")
+logging.info("[BOOT] mc_ws module imported")
+
 MC_WS_PORT = int(os.getenv("MC_WS_PORT", "8765"))
-MC_TOKEN_PEPPER = os.getenv("MC_TOKEN_PEPPER", "")  # keep this the same across restarts
+MC_TOKEN_PEPPER = os.getenv("MC_TOKEN_PEPPER", "")
 
-# token_hash -> {"ws": WebSocketResponse, "server": str, "ts": float}
-_connections: dict[str, dict] = {}
+_connections: Dict[str, Dict] = {}
+
+_ready_evt = asyncio.Event()
+def mark_discord_ready():
+    if not _ready_evt.is_set():
+        _ready_evt.set()
+        logging.info("[BOOT] mc_ws received discord-ready signal")
+async def _wait_ready():
+    await _ready_evt.wait()
+
+_pending_notifies: List[Tuple[str, str]] = []
+_pending_mc_msgs: List[Tuple[str, dict]] = []
+_pending_flush_started = False
+
+_http_session: Optional[ClientSession] = None
+def _http() -> ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = ClientSession()
+    return _http_session
+
+async def _http_shutdown():
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+    _http_session = None
+
+async def _flush_pending():
+    global _pending_notifies, _pending_mc_msgs
+    await _wait_ready()
+    if _pending_notifies:
+        for th, text in _pending_notifies:
+            try: await _notify_bound_channels(th, text)
+            except Exception as e: logging.warning("pending notify failed: %s", e)
+        _pending_notifies = []
+    if _pending_mc_msgs:
+        for th, data in _pending_mc_msgs:
+            try: await _relay_mc_to_discord(th, data)
+            except Exception as e: logging.warning("pending relay failed: %s", e)
+        _pending_mc_msgs = []
 
 def _token_hash(token: str) -> str:
     h = hashlib.sha256()
-    h.update((token.strip() + MC_TOKEN_PEPPER).encode("utf-8"))  # normalize here as well
+    h.update((token.strip() + MC_TOKEN_PEPPER).encode("utf-8"))
     return h.hexdigest()
+
+async def _lookup_webhook_for_link(guild_id: int, linked_channel_id: int) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Return (webhook_url, thread_id).
+    We store webhook per **parent text channel**; for thread links we store thread_id in mc_webhooks.
+    So: first try exact parent match (channel_id == linked_channel_id). If none, try thread_id == linked_channel_id.
+    """
+    await db.ensure_connected()
+    # exact channel match
+    cur = await db.conn.execute(
+        "SELECT webhook_url, thread_id FROM mc_webhooks WHERE guild_id=? AND channel_id=?",
+        (guild_id, linked_channel_id),
+    )
+    row = await cur.fetchone()
+    if row and row["webhook_url"]:
+        return (row["webhook_url"], row["thread_id"])
+    # thread mapping (linked channel is a thread; find parent webhook)
+    cur = await db.conn.execute(
+        "SELECT webhook_url, thread_id FROM mc_webhooks WHERE guild_id=? AND thread_id=?",
+        (guild_id, linked_channel_id),
+    )
+    row = await cur.fetchone()
+    if row and row["webhook_url"]:
+        return (row["webhook_url"], row["thread_id"])
+    return (None, None)
+
+async def _post_webhook(wh_url: str, content: Optional[str] = None,
+                        username: Optional[str] = None, avatar_url: Optional[str] = None,
+                        thread_id: Optional[int] = None) -> None:
+    url = wh_url
+    if thread_id:
+        sep = '&' if '?' in url else '?'
+        url = f"{url}{sep}thread_id={thread_id}"
+    payload: Dict[str, object] = {}
+    if content is not None: payload["content"] = content
+    if username is not None: payload["username"] = username
+    if avatar_url is not None: payload["avatar_url"] = avatar_url
+    async with _http().post(url, json=payload) as resp:
+        if resp.status >= 300:
+            txt = await resp.text()
+            raise RuntimeError(f"webhook post failed: HTTP {resp.status} {txt}")
 
 async def ws_handler(request: web.Request):
     ws = web.WebSocketResponse(heartbeat=20)
@@ -38,7 +118,6 @@ async def ws_handler(request: web.Request):
                     continue
 
                 op = data.get("op")
-
                 if op == "auth":
                     token = (data.get("token") or "").strip()
                     server_name = data.get("server") or server_name
@@ -50,30 +129,27 @@ async def ws_handler(request: web.Request):
                     _connections[token_hash] = {"ws": ws, "server": server_name, "ts": time.time()}
                     await ws.send_json({"op": "auth", "ok": True})
 
-                    # Mark connected
                     await db.ensure_connected()
                     cur = await db.conn.execute(
                         "UPDATE mc_links SET status='connected', server_name=?, last_seen=? WHERE token_hash=?",
                         (server_name, time.time(), token_hash),
                     )
                     await db.conn.commit()
-                    updated = cur.rowcount if hasattr(cur, "rowcount") else None
 
-                    # Notify channels bound to this hash
-                    bound = await _notify_bound_channels(token_hash, f"🟢 **{server_name}** connected.")
-                    logging.info(
-                        "MC auth ok: server=%s short_hash=%s row_update=%s bound_channels=%d",
-                        server_name, token_hash[:12], updated, bound
-                    )
-                    if bound == 0:
-                        logging.warning("Auth ok but no bound channels matched this hash. Did you /minecraft connect with the same token + pepper?")
+                    _pending_notifies.append((token_hash, f"🟢 **{server_name}** connected."))
+                    logging.info("MC auth ok: server=%s short_hash=%s row_update=%s (notify buffered until ready)",
+                                 server_name, token_hash[:12], getattr(cur, "rowcount", None))
+
+                    global _pending_flush_started
+                    if not _pending_flush_started:
+                        _pending_flush_started = True
+                        asyncio.create_task(_flush_pending())
 
                 elif op == "mc_chat":
-                    await _relay_mc_to_discord(token_hash, data)
-
-                else:
-                    # ignore unknown ops
-                    pass
+                    if _ready_evt.is_set():
+                        await _relay_mc_to_discord(token_hash, data)
+                    else:
+                        _pending_mc_msgs.append((token_hash, data))
 
             elif msg.type == web.WSMsgType.ERROR:
                 logging.warning("mc ws error: %s", ws.exception())
@@ -86,144 +162,114 @@ async def ws_handler(request: web.Request):
                 (time.time(), token_hash),
             )
             await db.conn.commit()
-            await _notify_bound_channels(token_hash, f"🔴 **{server_name}** disconnected. Waiting for reconnect…")
+            _pending_notifies.append((token_hash, f"🔴 **{server_name}** disconnected. Waiting for reconnect…"))
             st = _connections.get(token_hash)
             if st and st.get("ws") is ws:
                 _connections.pop(token_hash, None)
 
     return ws
 
-async def _notify_bound_channels(token_hash: str, text: str) -> int:
-    from .main import bot
+async def send_dc_chat(guild_id: int, channel_id: int, user: str, guild_name: str, text: str) -> int:
+    # Discord -> MC (unchanged)
     await db.ensure_connected()
     cur = await db.conn.execute(
-        "SELECT channel_id FROM mc_links WHERE token_hash=?", (token_hash,)
+        "SELECT token_hash FROM mc_links WHERE guild_id=? AND channel_id=? AND status='connected'",
+        (guild_id, channel_id),
     )
+    rows = await cur.fetchall()
+    if not rows:
+        logging.info("dc_chat: no active links for guild=%s channel=%s", guild_id, channel_id)
+        return 0
+    delivered = 0
+    payload = json.dumps({"op": "dc_chat", "user": user, "guild": guild_name, "text": text})
+    for r in rows:
+        st = _connections.get(r["token_hash"])
+        ws = st.get("ws") if st else None
+        if ws:
+            try:
+                await ws.send_str(payload)
+                delivered += 1
+            except Exception as e:
+                logging.warning("dc_chat: send failed for hash=%s: %s", r["token_hash"][:12], e)
+    logging.info("dc_chat: delivered=%d", delivered)
+    return delivered
+
+async def _notify_bound_channels(token_hash: str, text: str) -> int:
+    await _wait_ready()
+    await db.ensure_connected()
+    cur = await db.conn.execute("SELECT guild_id, channel_id FROM mc_links WHERE token_hash=?", (token_hash,))
     rows = await cur.fetchall()
     if not rows:
         logging.warning("notify: no rows for hash=%s", token_hash[:12])
         return 0
-
     sent = 0
     for r in rows:
-        cid = int(r["channel_id"])
-        ch = bot.get_channel(cid)  # relies on preload
-
-        if ch is None:
-            logging.warning("notify: channel %s not in cache after preload (wrong ID? deleted? perms?)", cid)
+        gid, cid = int(r["guild_id"]), int(r["channel_id"])
+        wh_url, thread_id = await _lookup_webhook_for_link(gid, cid)
+        if not wh_url:
+            logging.warning("notify: no webhook available for channel %s", cid)
             continue
-
         try:
-            await ch.send(text)  # type: ignore
+            await _post_webhook(wh_url, content=text, thread_id=thread_id)
             sent += 1
-        except discord.Forbidden:
-            logging.warning("notify: Forbidden sending to channel %s (missing perms)", cid)
         except Exception as e:
-            logging.warning("notify: send failed (channel_id=%s): %s", cid, e)
-
+            logging.warning("notify: webhook post failed for channel %s: %s", cid, e)
     return sent
 
-
-async def _get_or_create_webhook(guild: discord.Guild, channel: discord.TextChannel) -> discord.Webhook | None:
-    await db.ensure_connected()
-    cur = await db.conn.execute(
-        "SELECT webhook_id, webhook_token FROM mc_webhooks WHERE guild_id=? AND channel_id=?",
-        (guild.id, channel.id),
-    )
-    row = await cur.fetchone()
-    if row:
-        try:
-            wh = discord.Webhook.partial(
-                int(row["webhook_id"]),
-                row["webhook_token"],
-                adapter=discord.AsyncWebhookAdapter(guild._state.http._HTTPClient__session),
-            )
-            return wh
-        except Exception:
-            pass
-
-    try:
-        wh = await channel.create_webhook(name="Kavex MC Link")
-        await db.conn.execute(
-            "INSERT OR REPLACE INTO mc_webhooks(guild_id, channel_id, webhook_id, webhook_token) VALUES (?,?,?,?)",
-            (guild.id, channel.id, str(wh.id), wh.token),
-        )
-        await db.conn.commit()
-        return wh
-    except Exception as e:
-        logging.warning("create_webhook failed: %s", e)
-        return None
-
 async def _relay_mc_to_discord(token_hash: str, data: dict):
-    from .main import bot
+    await _wait_ready()
     player = data.get("player", "Player")
     uuid = data.get("uuid", "")
     text = data.get("text", "")
 
-    await db.ensure_connected()
-    cur = await db.conn.execute(
-        "SELECT guild_id, channel_id FROM mc_links WHERE token_hash=? AND status='connected'",
-        (token_hash,),
-    )
+    avatar = None
+    if uuid:
+        # Use default=MHF_Steve so Discord never gets a 404 (which shows as blank avatar)
+        avatar = f"https://crafatar.com/avatars/{uuid}?size=64&overlay&default=MHF_Steve"
+        await db.ensure_connected()
+        cur = await db.conn.execute(
+            "SELECT guild_id, channel_id FROM mc_links WHERE token_hash=? AND status='connected'",
+            (token_hash,),
+        )
+
     rows = await cur.fetchall()
     if not rows:
+        logging.info("relay: no channels bound for hash=%s", token_hash[:12])
         return
 
-    avatar = f"https://crafatar.com/avatars/{uuid}?size=64&overlay" if uuid else None
-
     for r in rows:
-        cid = int(r["channel_id"])
-        ch = bot.get_channel(cid)
-        if ch is None:
-            try:
-                ch = await bot.fetch_channel(cid)
-                logging.info("relay: fetched channel via API (channel_id=%s)", cid)
-            except Exception as e:
-                logging.warning("relay: fetch_channel failed (channel_id=%s): %s", cid, e)
-                continue
-
-        # Prefer webhook if it's a text-ish channel
-        if isinstance(ch, discord.TextChannel):
-            guild = ch.guild
-            wh = await _get_or_create_webhook(guild, ch)
-            if wh:
-                try:
-                    await wh.send(text, username=player, avatar_url=avatar, wait=False)
-                    continue
-                except Exception as e:
-                    logging.warning("webhook send failed: %s", e)
-        # Fallback for any messageable channel/thread
+        gid, cid = int(r["guild_id"]), int(r["channel_id"])
+        wh_url, thread_id = await _lookup_webhook_for_link(gid, cid)
+        if not wh_url:
+            logging.warning("relay: no webhook available for channel %s", cid)
+            continue
         try:
-            await ch.send(f"**{player}**: {text}")  # type: ignore
+            await _post_webhook(wh_url, content=text, username=player, avatar_url=avatar, thread_id=thread_id)
+            logging.info("relay: webhook posted to channel %s (thread_id=%s)", cid, thread_id)
         except Exception as e:
-            logging.warning("relay fallback send failed (channel_id=%s): %s", cid, e)
+            logging.warning("relay: webhook post failed for %s: %s", cid, e)
 
 async def run_ws_app():
+    logging.info("[BOOT] run_ws_app() starting")
     app = web.Application()
     app.add_routes([web.get("/mcws", ws_handler)])
     runner = web.AppRunner(app)
     try:
         await runner.setup()
-        # IPv4
-        try:
-            site4 = web.TCPSite(runner, "0.0.0.0", MC_WS_PORT)
-            await site4.start()
-            logging.info("MC WebSocket (IPv4) listening on 0.0.0.0:%s", MC_WS_PORT)
-        except Exception as e:
-            logging.exception("Failed to start IPv4 WS listener: %s", e)
-        # IPv6
+        site4 = web.TCPSite(runner, "0.0.0.0", MC_WS_PORT)
+        await site4.start()
+        logging.info("MC WebSocket (IPv4) listening on 0.0.0.0:%s", MC_WS_PORT)
         try:
             site6 = web.TCPSite(runner, "::", MC_WS_PORT)
             await site6.start()
             logging.info("MC WebSocket (IPv6) listening on [::]:%s", MC_WS_PORT)
         except Exception as e:
             logging.warning("IPv6 WS listener not started: %s", e)
-
-        # Keep running
         while True:
             await asyncio.sleep(3600)
-
     except Exception as e:
         logging.exception("MC WS server crashed during startup: %s", e)
         raise
+    finally:
+        await _http_shutdown()
 

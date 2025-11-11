@@ -1,5 +1,7 @@
+# src/bot/db.py
 import aiosqlite
 from pathlib import Path
+import logging
 
 DB_PATH = Path("bot.sqlite3")
 
@@ -42,6 +44,10 @@ CREATE TABLE IF NOT EXISTS mc_links(
   PRIMARY KEY (guild_id, channel_id)
 );
 
+/*
+Legacy schema kept for first run; a migration below may rebuild this table
+to relax NOT NULL constraints and add webhook_url/thread_id.
+*/
 CREATE TABLE IF NOT EXISTS mc_webhooks(
   guild_id INTEGER NOT NULL,
   channel_id INTEGER NOT NULL,
@@ -62,11 +68,22 @@ class DB:
         self._conn = await aiosqlite.connect(self.path.as_posix())
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(INIT_SQL)
+
         # Migrations for existing DBs
         await self._ensure_column("guild_settings", "command_channel_id", "INTEGER")
         await self._ensure_column("guild_settings", "default_role_id", "INTEGER")
         await self._ensure_column("reaction_roles", "channel_id", "INTEGER")
+
+        # Ensure mc_links has the newer metadata columns (no-op if present)
+        await self._ensure_column("mc_links", "server_name", "TEXT")
+        await self._ensure_column("mc_links", "last_seen", "REAL")
+        await self._ensure_column("mc_links", "status", "TEXT")
+
+        # Ensure mc_webhooks has webhook_url + thread_id
+        await self._migrate_mc_webhooks_if_needed()
+
         await self._conn.commit()
+        logging.info("DB schema ensured/migrated at %s", self.path)
         return self
 
     async def _ensure_column(self, table: str, column: str, coltype: str):
@@ -74,6 +91,99 @@ class DB:
         cols = [r["name"] for r in await cur.fetchall()]
         if column not in cols:
             await self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+    async def _migrate_mc_webhooks_if_needed(self):
+        """
+        Make sure mc_webhooks has:
+          - webhook_url TEXT (new)
+          - thread_id INTEGER (new)
+        and that webhook_id/webhook_token are *nullable* (old schema had NOT NULL).
+        If the table lacks webhook_url OR webhook_id/webhook_token are NOT NULL,
+        rebuild the table with the relaxed schema and copy data.
+        """
+        # If table doesn't exist yet, INIT_SQL created it; we still might need to rebuild it.
+        cur = await self._conn.execute("PRAGMA table_info(mc_webhooks)")
+        rows = await cur.fetchall()
+        if not rows:
+            # Table truly missing (unlikely). Create with the new relaxed schema.
+            await self._create_mc_webhooks_relaxed()
+            return
+
+        cols = {row["name"]: row for row in rows}
+        needs_rebuild = False
+
+        # webhook_url present?
+        if "webhook_url" not in cols:
+            needs_rebuild = True
+
+        # thread_id present?
+        if "thread_id" not in cols:
+            needs_rebuild = True
+
+        # Are webhook_id/webhook_token NOT NULL? (notnull == 1 means NOT NULL)
+        # We want them NULL-able so we can store only webhook_url.
+        for legacy in ("webhook_id", "webhook_token"):
+            if legacy in cols and cols[legacy]["notnull"] == 1:
+                needs_rebuild = True
+
+        if needs_rebuild:
+            await self._rebuild_mc_webhooks_relaxed()
+        else:
+            # If no rebuild needed, at least ensure columns (idempotent safety)
+            await self._ensure_column("mc_webhooks", "webhook_url", "TEXT")
+            await self._ensure_column("mc_webhooks", "thread_id", "INTEGER")
+
+    async def _create_mc_webhooks_relaxed(self):
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS mc_webhooks(
+              guild_id     INTEGER NOT NULL,
+              channel_id   INTEGER NOT NULL,   -- parent TextChannel id
+              webhook_id   TEXT,               -- legacy (optional now)
+              webhook_token TEXT,              -- legacy (optional now)
+              webhook_url  TEXT,               -- preferred new field
+              thread_id    INTEGER,            -- if link target is a thread
+              PRIMARY KEY (guild_id, channel_id)
+            )
+        """)
+
+    async def _rebuild_mc_webhooks_relaxed(self):
+        # Create new table with relaxed schema
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS mc_webhooks_new(
+              guild_id     INTEGER NOT NULL,
+              channel_id   INTEGER NOT NULL,
+              webhook_id   TEXT,
+              webhook_token TEXT,
+              webhook_url  TEXT,
+              thread_id    INTEGER,
+              PRIMARY KEY (guild_id, channel_id)
+            )
+        """)
+        # Copy over whatever legacy data exists
+        # (columns may or may not exist; select defensively)
+        cur = await self._conn.execute("PRAGMA table_info(mc_webhooks)")
+        cols = [r["name"] for r in await cur.fetchall()]
+        legacy_cols = ["guild_id", "channel_id"]
+        if "webhook_id" in cols: legacy_cols.append("webhook_id")
+        if "webhook_token" in cols: legacy_cols.append("webhook_token")
+
+        # Build SELECT list (missing cols get NULL)
+        select_list = ", ".join(
+            [f"{c}" for c in ["guild_id", "channel_id"]]
+            + [("webhook_id" if "webhook_id" in cols else "NULL AS webhook_id")]
+            + [("webhook_token" if "webhook_token" in cols else "NULL AS webhook_token")]
+        )
+        await self._conn.execute(f"""
+            INSERT OR REPLACE INTO mc_webhooks_new(guild_id, channel_id, webhook_id, webhook_token, webhook_url, thread_id)
+            SELECT {select_list}, NULL AS webhook_url, NULL AS thread_id
+            FROM mc_webhooks
+        """)
+
+        # Swap tables
+        await self._conn.execute("DROP TABLE mc_webhooks")
+        await self._conn.execute("ALTER TABLE mc_webhooks_new RENAME TO mc_webhooks")
+        await self._conn.commit()
+        logging.info("DB migration: rebuilt mc_webhooks with webhook_url/thread_id and relaxed NULLs")
 
     async def ensure_connected(self):
         if self._conn is None:
