@@ -30,8 +30,7 @@ A public demo instance is available:
 
 ### 🔄 Real Discord ↔ Minecraft Chat Mirroring
 - Minecraft → Discord messages appear as the **player** (avatar = skin head render)
-- Discord → Minecraft messages include **formatted usernames**, colors, and role badges
-- Supports Unicode, emojis, embeds, markdown
+- Discord → Minecraft messages include **formatted usernames**
 
 ### 🔐 Secure by Design (TLS Everywhere)
 - Fully encrypted TLS websocket (wss://)
