@@ -1,7 +1,7 @@
 # Kavex Bot — Secure Discord ↔ Minecraft Bridge  
 ### A Free, Open-Source, TLS-Encrypted WebSocket Chat Link for Minecraft Servers
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-green.svg)
 ![Python](https://img.shields.io/badge/Python-3.11+-blue)
 ![Status](https://img.shields.io/badge/status-active-success)
 
