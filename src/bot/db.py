@@ -55,6 +55,54 @@ CREATE TABLE IF NOT EXISTS mc_webhooks(
   webhook_token TEXT NOT NULL,
   PRIMARY KEY (guild_id, channel_id)
 );
+
+
+-- Discord <-> Minecraft account links
+CREATE TABLE IF NOT EXISTS user_links(
+  guild_id   INTEGER NOT NULL,
+  discord_id INTEGER NOT NULL,
+  mc_uuid    TEXT,
+  mc_name    TEXT,
+  linked_at  REAL DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (guild_id, discord_id)
+);
+
+-- short-lived link tokens (code from /linkdiscord in-game)
+CREATE TABLE IF NOT EXISTS link_tokens(
+  token      TEXT PRIMARY KEY,
+  mc_uuid    TEXT,
+  mc_name    TEXT,
+  created_at REAL,
+  used       INTEGER DEFAULT 0
+);
+
+-- per-role permission mapping for MC moderation + cosmetics
+CREATE TABLE IF NOT EXISTS mc_perms(
+  guild_id    INTEGER NOT NULL,
+  role_id     INTEGER NOT NULL,
+  can_kick    INTEGER DEFAULT 0,
+  can_ban     INTEGER DEFAULT 0,
+  can_timeout INTEGER DEFAULT 0,
+  is_staff    INTEGER DEFAULT 0,
+  prefix      TEXT,
+  color_hex   TEXT,
+  PRIMARY KEY (guild_id, role_id)
+);
+
+-- cached effective perms per MC account (for outage fallback)
+CREATE TABLE IF NOT EXISTS mc_perm_cache(
+  guild_id    INTEGER NOT NULL,
+  mc_uuid     TEXT,
+  mc_name     TEXT,
+  can_kick    INTEGER DEFAULT 0,
+  can_ban     INTEGER DEFAULT 0,
+  can_timeout INTEGER DEFAULT 0,
+  is_staff    INTEGER DEFAULT 0,
+  prefix      TEXT,
+  color_hex   TEXT,
+  last_sync   REAL,
+  PRIMARY KEY (guild_id, mc_uuid)
+);
 """
 
 class DB:

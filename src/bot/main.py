@@ -42,7 +42,7 @@ class MyBot(commands.Bot):
                 owner_id = interaction.guild.owner_id if interaction.guild else None
                 is_admin = perms.administrator or (owner_id == member.id)
 
-            NONADMIN_ALLOW = set()
+            NONADMIN_ALLOW = {"linkdiscord"}
             cmd_name = interaction.command.qualified_name if interaction.command else ""
             if not is_admin and cmd_name not in NONADMIN_ALLOW:
                 if not interaction.response.is_done():
@@ -53,20 +53,39 @@ class MyBot(commands.Bot):
 
             # command-channel gate (optional)
             await db.ensure_connected()
+
+            # 1) Get the primary command channel (if configured)
             cur = await db.conn.execute(
                 "SELECT command_channel_id FROM guild_settings WHERE guild_id=?",
                 (interaction.guild_id,),
             )
             row = await cur.fetchone()
-            allowed_channel_id = row["command_channel_id"] if row and row["command_channel_id"] else None
-            if allowed_channel_id and interaction.channel_id != allowed_channel_id:
-                ch = interaction.guild.get_channel(allowed_channel_id)
-                target = ch.mention if ch else f"<#{allowed_channel_id}>"
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        f"Use commands in {target}.", ephemeral=False
-                    )
-                return False
+            command_channel_id = row["command_channel_id"] if row and row["command_channel_id"] else None
+
+            # 2) Collect all MC-linked channels for this guild
+            mc_cur = await db.conn.execute(
+                "SELECT channel_id FROM mc_links WHERE guild_id=?",
+                (interaction.guild_id,),
+            )
+            mc_rows = await mc_cur.fetchall()
+            mc_channels = {int(r["channel_id"]) for r in mc_rows} if mc_rows else set()
+
+            ch_id = interaction.channel_id
+
+            # If a command channel is configured:
+            #   - allow that channel
+            #   - allow all MC-linked channels
+            if command_channel_id is not None:
+                if ch_id != command_channel_id and ch_id not in mc_channels:
+                    # Still reject, but mention where they *should* go
+                    ch = interaction.guild.get_channel(command_channel_id)
+                    target = ch.mention if ch else f"<#{command_channel_id}>"
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(
+                            f"Use commands in {target} or in the linked Minecraft channel(s).",
+                            ephemeral=False,
+                        )
+                    return False
 
             return True
 
@@ -79,6 +98,8 @@ class MyBot(commands.Bot):
         await self.load_extension("src.bot.cogs.server_admin")
         await self.load_extension("src.bot.cogs.minecraft")
         await self.load_extension("src.bot.cogs.mc_forward")
+        await self.load_extension("src.bot.cogs.mc_mod_bridge")
+        await self.load_extension("src.bot.cogs.mc_identity")
 
         try:
             await self.tree.sync()

@@ -2,6 +2,7 @@ import hashlib, time, os, re, typing, discord
 from discord.ext import commands
 from discord import app_commands
 from ..db import db
+from .. import mc_ws
 
 PEPPER = os.getenv("MC_TOKEN_PEPPER", "")
 
@@ -118,6 +119,72 @@ class MinecraftLink(commands.Cog):
             f"Linked to {channel.mention}. Waiting for server auth… (hash `{th[:12]}`)",
             ephemeral=False,
         )
+
+    @group.command(name="kick", description="Kick an in-game player via the Minecraft server")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(
+        player="Exact Minecraft player name",
+        reason="Optional reason to show in-game"
+    )
+    async def kick(
+        self,
+        interaction: discord.Interaction,
+        player: str,
+        reason: str | None = None,
+    ):
+        reason_str = reason or "Kicked by Discord admin"
+        delivered = await mc_ws.send_dc_admin(
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            action="kick",
+            player=player,
+            reason=reason_str,
+            issued_by=str(interaction.user),
+        )
+
+        if delivered > 0:
+            await interaction.response.send_message(
+                f"✅ Sent **kick** for `{player}` to {delivered} linked server(s).",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "⚠️ No active linked Minecraft server for this channel.",
+                ephemeral=True,
+            )
+
+    @group.command(name="ban", description="Ban an in-game player via the Minecraft server")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(
+        player="Exact Minecraft player name",
+        reason="Optional reason to show in-game"
+    )
+    async def ban(
+            self,
+            interaction: discord.Interaction,
+            player: str,
+            reason: str | None = None,
+        ):
+            reason_str = reason or "Banned by Discord admin"
+            delivered = await mc_ws.send_dc_admin(
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                action="ban",
+                player=player,
+                reason=reason_str,
+                issued_by=str(interaction.user),
+            )
+
+            if delivered > 0:
+                await interaction.response.send_message(
+                    f"✅ Sent **ban** for `{player}` to {delivered} linked server(s).",
+                    ephemeral=False,
+                )
+            else:
+                await interaction.response.send_message(
+                    "⚠️ No active linked Minecraft server for this channel.",
+                    ephemeral=False,
+                )
 
     @group.command(name="disconnect", description="Unlink the Minecraft server from this channel/thread")
     @app_commands.default_permissions(administrator=True)

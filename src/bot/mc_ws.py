@@ -184,6 +184,35 @@ async def ws_handler(request: web.Request):
                         await _relay_mc_event_to_discord(token_hash, data)
                     else:
                         _pending_mc_msgs.append((token_hash, data))
+                elif op == "mc_link_request":
+                    # Player requested a Discord link in-game
+                    code = (data.get("code") or "").strip()
+                    mc_uuid = (data.get("uuid") or "").strip()
+                    mc_name = (data.get("name") or "").strip()
+
+                    if not code or not mc_name:
+                        await ws.send_json({
+                            "op": "mc_link_ack",
+                            "ok": False,
+                            "err": "missing code or name"
+                        })
+                        continue
+
+                    await db.ensure_connected()
+                    now = time.time()
+                    await db.conn.execute(
+                        "INSERT OR REPLACE INTO link_tokens(token, mc_uuid, mc_name, created_at, used) "
+                        "VALUES (?,?,?,?,0)",
+                        (code, mc_uuid, mc_name, now),
+                    )
+                    await db.conn.commit()
+
+                    await ws.send_json({"op": "mc_link_ack", "ok": True})
+                    logging.info(
+                        "Stored link token %s for player %s uuid=%s",
+                        code, mc_name, mc_uuid
+                    )
+
 
             elif msg.type == web.WSMsgType.ERROR:
                 logging.warning("mc ws error: %s", ws.exception())
@@ -203,9 +232,18 @@ async def ws_handler(request: web.Request):
 
     return ws
 
-async def send_dc_chat(guild_id: int, channel_id: int, user: str, guild_name: str, text: str) -> int:
+async def send_dc_chat(
+    guild_id: int,
+    channel_id: int,
+    user: str,
+    guild_name: str,
+    text: str,
+    prefix: str | None = None,
+    color: str | None = None,
+) -> int:
     """
-    Discord -> MC (over WS). Unchanged.
+    Discord -> MC (over WS).
+    Optionally includes Discord-derived prefix and color.
     """
     await db.ensure_connected()
     cur = await db.conn.execute(
@@ -218,7 +256,19 @@ async def send_dc_chat(guild_id: int, channel_id: int, user: str, guild_name: st
         return 0
 
     delivered = 0
-    payload = json.dumps({"op": "dc_chat", "user": user, "guild": guild_name, "text": text})
+    payload_dict: dict[str, object] = {
+        "op": "dc_chat",
+        "user": user,
+        "guild": guild_name,
+        "text": text,
+    }
+    if prefix is not None:
+        payload_dict["prefix"] = prefix
+    if color is not None:
+        payload_dict["color"] = color
+
+    payload = json.dumps(payload_dict)
+
     for r in rows:
         th = r["token_hash"]
         st = _connections.get(th)
@@ -230,6 +280,60 @@ async def send_dc_chat(guild_id: int, channel_id: int, user: str, guild_name: st
             except Exception as e:
                 logging.warning("dc_chat: send failed for hash=%s: %s", th[:12], e)
     logging.info("dc_chat: delivered=%d", delivered)
+    return delivered
+
+async def send_dc_admin(
+    guild_id: int,
+    channel_id: int,
+    action: str,
+    player: str,
+    reason: str,
+    issued_by: str,
+) -> int:
+    """
+    Discord -> MC admin command (kick/ban/etc.).
+    Sent as op='dc_admin' over the existing WebSocket link.
+    """
+    await db.ensure_connected()
+    cur = await db.conn.execute(
+        "SELECT token_hash FROM mc_links WHERE guild_id=? AND channel_id=? AND status='connected'",
+        (guild_id, channel_id),
+    )
+    rows = await cur.fetchall()
+    if not rows:
+        logging.info(
+            "dc_admin: no active links for guild=%s channel=%s",
+            guild_id,
+            channel_id,
+        )
+        return 0
+
+    payload = json.dumps({
+        "op": "dc_admin",
+        "action": action,            # "kick", "ban", "pardon", "command", etc.
+        "player": player,
+        "reason": reason,
+        "issued_by": issued_by,      # "Name#1234" or just display_name
+    })
+
+    delivered = 0
+    for r in rows:
+        th = r["token_hash"]
+        st = _connections.get(th)
+        ws = st.get("ws") if st else None
+        if ws:
+            try:
+                await ws.send_str(payload)
+                delivered += 1
+            except Exception as e:
+                logging.warning("dc_admin: send failed for hash=%s: %s", th[:12], e)
+
+    logging.info(
+        "dc_admin: action=%s player=%s delivered=%d",
+        action,
+        player,
+        delivered,
+    )
     return delivered
 
 async def _notify_bound_channels(token_hash: str, text: str) -> int:
