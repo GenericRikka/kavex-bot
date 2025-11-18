@@ -92,6 +92,47 @@ class MCIdentity(commands.Cog):
             ephemeral=True,
         )
 
+    @app_commands.guild_only()
+    @app_commands.command(
+        name="mention_notify",
+        description="Enable or disable Minecraft ping sounds when someone @mentions your MC name in Discord."
+    )
+    async def mention_notify(
+        self,
+        interaction: discord.Interaction,
+        enabled: bool
+    ):
+        await db.ensure_connected()
+
+        # Find this user's linked MC account for this guild
+        cur = await db.conn.execute(
+            "SELECT mc_name FROM user_links WHERE guild_id=? AND discord_id=?",
+            (interaction.guild_id, interaction.user.id),
+        )
+        row = await cur.fetchone()
+        if not row:
+            await interaction.response.send_message(
+                "You don’t have a linked Minecraft account on this server. "
+                "Use `/linkdiscord` in-game first.",
+                ephemeral=True,
+            )
+            return
+
+        mc_name = row["mc_name"]
+
+        await db.conn.execute(
+            "UPDATE user_links SET notify_ping=? "
+            "WHERE guild_id=? AND discord_id=?",
+            (1 if enabled else 0, interaction.guild_id, interaction.user.id),
+        )
+        await db.conn.commit()
+
+        await interaction.response.send_message(
+            f"Minecraft mention ping has been **{'enabled' if enabled else 'disabled'}** "
+            f"for **{mc_name}**.",
+            ephemeral=True,
+        )
+
     # ---------- Role → perm mapping ----------
 
     @app_commands.command(

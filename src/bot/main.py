@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import commands
 from .db import db
+from . import mc_ws
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -139,6 +140,7 @@ async def on_ready():
     # Signal readiness BEFORE starting WS
     logging.info("[BOOT] calling mc_ws.mark_discord_ready()")
     mc_ws.mark_discord_ready()
+    mc_ws.set_bot(bot)
 
     # Start WS once
     if bot._ws_task is None or bot._ws_task.done():

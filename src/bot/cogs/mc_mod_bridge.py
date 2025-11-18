@@ -81,17 +81,28 @@ class MCModBridge(commands.Cog):
         action: str,
     ) -> tuple[bool, discord.Member | None, str | None]:
         """
-        Resolve the MC player name to a linked Discord user, then
-        determine from mc_perms (+ cache) whether they can perform `action`.
+        Resolve the MC player name to a linked Discord user, then decide permission
+        based on *native Discord guild permissions*:
 
-        Also computes a cosmetic prefix and color from Discord roles:
-          - color: highest-priority role with a non-default color
-          - prefix: highest-priority hoisted role (sidebar), falling back to
-                    the color role, then highest role.
+          - kick:    member.guild_permissions.kick_members or administrator
+          - ban:     member.guild_permissions.ban_members or administrator
+          - timeout: member.guild_permissions.moderate_members or administrator
+
+        Also computes prefix & color from roles and caches them in mc_perm_cache.
 
         Returns (allowed, member_or_None, reason_if_denied).
         """
         await db.ensure_connected()
+
+        # Cross-moderation toggle: if disabled, MC → Discord moderation is off
+        cur = await db.conn.execute(
+            "SELECT crossmod_enabled FROM guild_settings WHERE guild_id=?",
+            (guild.id,),
+        )
+        row = await cur.fetchone()
+        if row and row["crossmod_enabled"] == 0:
+            return False, None, "Cross moderation is disabled for this server."
+
 
         # Find linked account by mc_name (case-sensitive for now)
         cur = await db.conn.execute(
@@ -117,45 +128,46 @@ class MCModBridge(commands.Cog):
         color_hex: str | None = None
 
         if member is not None:
-            # ---- Effective perms from roles ----
-            roles = [r for r in member.roles if not r.is_default()]
-            if roles:
-                role_ids = [r.id for r in roles]
-                placeholders = ",".join("?" for _ in role_ids)
-                query = (
-                    f"SELECT can_kick, can_ban, can_timeout, is_staff "
-                    f"FROM mc_perms WHERE guild_id=? AND role_id IN ({placeholders})"
-                )
-                args = [guild.id, *role_ids]
-                cur = await db.conn.execute(query, args)
-                rows = await cur.fetchall()
-            else:
-                rows = []
+            perms = member.guild_permissions
 
-            can_kick = any(r["can_kick"] for r in rows)
-            can_ban = any(r["can_ban"] for r in rows)
-            can_timeout = any(r["can_timeout"] for r in rows)
-            is_staff = any(r["is_staff"] for r in rows)
+            can_kick = bool(perms.kick_members or perms.administrator)
+            can_ban = bool(perms.ban_members or perms.administrator)
+            # discord.py 2.x exposes moderate_members for timeout perms
+            can_timeout = bool(getattr(perms, "moderate_members", False) or perms.administrator)
+
+            # consider "staff" broadly: anyone who can do at least one of these or manage_guild/roles/messages
+            is_staff = any(
+                [
+                    can_kick,
+                    can_ban,
+                    can_timeout,
+                    perms.manage_guild,
+                    perms.manage_roles,
+                    getattr(perms, "moderate_members", False),
+                    perms.manage_messages,
+                    perms.administrator,
+                ]
+            )
 
             # ---- Color: highest-priority colored role ----
+            roles = [r for r in member.roles if not r.is_default()]
             colored_roles = [r for r in roles if r.colour.value != 0]
             color_role = max(colored_roles, key=lambda r: r.position) if colored_roles else None
             if color_role is not None:
                 color_hex = f"#{color_role.colour.value:06X}"
 
             # ---- Prefix role: hoisted role on sidebar, else color role, else top role ----
-            hoisted_roles = [r for r in roles if r.hoist]
-            if hoisted_roles:
-                prefix_role = max(hoisted_roles, key=lambda r: r.position)
-            elif color_role is not None:
-                prefix_role = color_role
-            elif roles:
-                prefix_role = max(roles, key=lambda r: r.position)
-            else:
-                prefix_role = None
-
-            if prefix_role is not None:
+            if roles:
+                hoisted_roles = [r for r in roles if r.hoist]
+                if hoisted_roles:
+                    prefix_role = max(hoisted_roles, key=lambda r: r.position)
+                elif color_role is not None:
+                    prefix_role = color_role
+                else:
+                    prefix_role = max(roles, key=lambda r: r.position)
                 prefix = f"[{prefix_role.name}]"
+            else:
+                is_staff = False  # no roles, probably not staff
 
             # ---- Update cache with both perms and cosmetics ----
             await db.conn.execute(
@@ -188,7 +200,7 @@ class MCModBridge(commands.Cog):
                 can_kick = bool(rowc["can_kick"])
                 can_ban = bool(rowc["can_ban"])
                 can_timeout = bool(rowc["can_timeout"])
-                is_staff = bool(rowc["is_staff"])
+                # is_staff = bool(rowc["is_staff"])  # not used directly here
                 prefix = rowc["prefix"]
                 color_hex = rowc["color_hex"]
             else:
@@ -203,9 +215,8 @@ class MCModBridge(commands.Cog):
         if not allowed:
             return False, member, "You are not allowed to perform that action from Minecraft."
 
-        # NOTE: we don't yet *use* prefix/color in MC, but they're cached and ready.
+        # prefix/color are now cached and will also be visible to the MC plugin via mc_perm_query.
         return True, member, None
-
 
     # ---------- Main listener ----------
 
@@ -282,6 +293,14 @@ class MCModBridge(commands.Cog):
             await self._kick_user(message, target_member, requester, reason)
 
         elif cmd == "!dctimeout":
+            # Syntax: !dctimeout <user> <minutes> [reason...]
+            if len(parts) < 3:
+                await message.channel.send(
+                    "Usage: `!dctimeout <user> <minutes> [reason...]`",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+
             ok, linked_member, deny_reason = await self._check_mc_permission(
                 message.guild,
                 requester,
@@ -294,7 +313,29 @@ class MCModBridge(commands.Cog):
                 )
                 return
 
-            # existing minutes + reason parsing, then:
+            raw_minutes = parts[2]
+            try:
+                minutes = int(raw_minutes)
+            except ValueError:
+                await message.channel.send(
+                    f"❌ `{raw_minutes}` is not a valid number of minutes.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+
+            if minutes <= 0:
+                await message.channel.send(
+                    "❌ Minutes must be greater than 0.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+
+            reason = (
+                " ".join(parts[3:])
+                if len(parts) > 3
+                else f"Requested from MC by {requester}"
+            )
+
             await self._timeout_user(message, target_member, requester, minutes, reason)
 
 
